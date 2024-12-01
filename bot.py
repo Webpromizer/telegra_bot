@@ -1,71 +1,139 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ChatJoinRequest
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-import asyncio
-# Вставьте токен вашего бота от BotFather
-API_TOKEN = "8046428888:AAE6subVaWXogC7rm3VxmxTYFG9PNKRxuHI"
+from telegram import Update
+from telegram.ext import filters, Application, CommandHandler, MessageHandler, ContextTypes, ChatJoinRequestHandler
 
-# Инициализация бота и диспетчера
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+# Хранилище правильных ответов
+correct_users = []
+
+# Хранилище отклонённых пользователей
+declined_users = []
+
+# ID администратора
+ADMIN_ID = 806048645
+
+# Вопрос и правильный ответ
+QUESTION = "Вы бизнесмен?"
+CORRECT_ANSWER = "царевич"
+
+# Включаем логирование
+import logging
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def is_suspicious_user(user, update):
+    """Проверяет пользователя на подозрительное поведение."""
+    # Проверка: является ли ботом
+    if user.is_bot:
+        return True, "Пользователь является ботом."
+
+    # Если пользователь не подозрителен
+    return False, None
 
 
-# Состояния для FSM (Finite State Machine)
-class JoinRequest(StatesGroup):
-    waiting_for_answer = State()
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка запроса на вступление в канал"""
+    chat_join_request = update.chat_join_request
+    user = chat_join_request.from_user
 
+    # Проверка пользователя на подозрительность
+    is_suspicious, reason = await is_suspicious_user(user, update)
+    if is_suspicious:
+        declined_users.append({
+            'user_id': user.id,
+            'username': user.username,
+            'full_name': user.full_name,
+            'reason': reason
+        })
+        await context.bot.decline_chat_join_request(chat_join_request.chat.id, user.id)
+        return
 
-# Обработка запроса на вступление
-@dp.chat_join_request()
-async def handle_join_request(request: types.ChatJoinRequest):
-    # Получаем данные о пользователе
-    user = request.from_user
-    chat_id = request.chat.id
-
-    # Сохраняем ID группы и пользователя для последующей обработки
-    await bot.send_message(
+    # Отправляем вопрос пользователю
+    await context.bot.send_message(
         chat_id=user.id,
-        text=(
-            f"Привет, {user.full_name}! Перед вступлением в группу, ответьте на следующий вопрос:\n"
-            "Какая цель вашего вступления в эту группу?"
-        ),
+        text=f"Здравствуйте, {user.full_name}! {QUESTION}"
     )
+    context.user_data[user.id] = {
+        'awaiting_answer': True,
+        'chat_id': chat_join_request.chat.id
+    }
 
-    # Устанавливаем состояние пользователя через FSMContext
-    await state.set_state(JoinRequest.waiting_for_answer)
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ответа пользователя"""
+    user = update.effective_user
+    user_data = context.user_data.setdefault(user.id, {})
 
-    # Сохраняем данные для проверки
-    await dp.storage.set_data(chat=user.id, data={"chat_id": chat_id, "user_id": user.id})
+    if not user_data.get('awaiting_answer'):
+        await update.message.reply_text("Вы не подавали заявку или уже ответили.")
+        return
 
+    context.user_data[user.id]['awaiting_answer'] = False
+    answer = update.message.text.strip().lower()
 
-# Обработка ответа пользователя
-@dp.message(JoinRequest.waiting_for_answer)
-async def collect_answer(message: types.Message, state: FSMContext):
-    # Получаем сохраненные данные
-    data = await state.get_data()
-    chat_id = data.get("chat_id")
-    user_id = data.get("user_id")
+    chat_id = user_data.get('chat_id')
+    if not chat_id:
+        await update.message.reply_text("Произошла ошибка: отсутствует chat_id.")
+        return
 
-    # Проверяем ответ
-    if "инвестировать" in message.text.lower():
-        # Одобряем запрос
-        await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-        await message.answer("Спасибо за ваш ответ! Добро пожаловать в группу.")
+    if answer == CORRECT_ANSWER:
+        correct_users.append({
+            'user_id': user.id,
+            'full_name': user.full_name
+        })
+        await context.bot.approve_chat_join_request(chat_id, user.id)
+        await update.message.reply_text("Ваш ответ правильный! Вы добавлены в группу.")
     else:
-        # Отклоняем запрос
-        await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
-        await message.answer("Ваш ответ не соответствует требованиям группы.")
+        declined_users.append({
+            'user_id': user.id,
+            'username': user.username,
+            'full_name': user.full_name,
+            'reason': "Неправильный ответ"
+        })
+        await context.bot.decline_chat_join_request(chat_id, user.id)
+        await update.message.reply_text("Ответ неправильный. Вы не можете быть добавлены в группу.")
 
-    # Завершаем состояние
-    await state.clear()
+async def list_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр принятых пользователей"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
+        return
 
+    if not correct_users:
+        await update.message.reply_text("Нет принятых пользователей.")
+        return
 
-async def main():
-    # Запуск polling
-    await dp.start_polling(bot)
+    response = "Список принятых пользователей:\n\n"
+    for user in correct_users:
+        response += f"ID: {user['user_id']}, Имя: {user['full_name']}\n"
 
+    await update.message.reply_text(response)
+
+async def list_declined_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр отклонённых пользователей"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
+        return
+
+    if not declined_users:
+        await update.message.reply_text("Нет отклонённых пользователей.")
+        return
+
+    response = "Список отклонённых пользователей:\n\n"
+    for user in declined_users:
+        response += f"ID: {user['user_id']}, Ник: {user['username']}, Имя: {user['full_name']}, Причина: {user['reason']}\n"
+
+    await update.message.reply_text(response)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    TOKEN = "8046428888:AAE6subVaWXogC7rm3VxmxTYFG9PNKRxuHI"
+    app = Application.builder().token(TOKEN).build()
+
+    # Обработчик для заявок на вступление
+    app.add_handler(ChatJoinRequestHandler(handle_join_request))
+    # Обработчик ответов пользователей
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer))
+    # Команда для просмотра отклонённых пользователей
+    app.add_handler(CommandHandler("decline_list", list_declined_users))
+    # Добавляем обработчик для команды list_correct
+    app.add_handler(CommandHandler("list_correct", list_correct))
+
+    print("Бот запущен...")
+    app.run_polling()
