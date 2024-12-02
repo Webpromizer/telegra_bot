@@ -1,18 +1,14 @@
 from telegram import Update
 from telegram.ext import filters, Application, CommandHandler, MessageHandler, ContextTypes, ChatJoinRequestHandler
 
-# Хранилище правильных ответов
-correct_users = []
-
-# Хранилище отклонённых пользователей
-declined_users = []
+# Хранилище пользователей с их ответами
+users_data = []
 
 # ID администратора
 ADMIN_ID = 806048645
 
 # Вопрос и правильный ответ
 QUESTION = "Вы бизнесмен?"
-CORRECT_ANSWER = "царевич"
 
 # Включаем логирование
 import logging
@@ -36,13 +32,18 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Проверка пользователя на подозрительность
     is_suspicious, reason = await is_suspicious_user(user, update)
+    
+    # Сохраняем информацию о пользователе
+    users_data.append({
+        'user_id': user.id,
+        'full_name': user.full_name,
+        'username': user.username,
+        'suspicious': is_suspicious,
+        'answer': None,
+        'chat_id': chat_join_request.chat.id  # Сохраняем chat_id для добавления позже
+    })
+
     if is_suspicious:
-        declined_users.append({
-            'user_id': user.id,
-            'username': user.username,
-            'full_name': user.full_name,
-            'reason': reason
-        })
         await context.bot.decline_chat_join_request(chat_join_request.chat.id, user.id)
         return
 
@@ -68,59 +69,70 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[user.id]['awaiting_answer'] = False
     answer = update.message.text.strip().lower()
 
-    chat_id = user_data.get('chat_id')
-    if not chat_id:
-        await update.message.reply_text("Произошла ошибка: отсутствует chat_id.")
+    # Обновляем ответ пользователя
+    for data in users_data:
+        if data['user_id'] == user.id:
+            data['answer'] = answer
+
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="Ваш ответ сохранен. Пожалуйста, ожидайте проверки администратором."
+    )
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр всех пользователей с их ответами и подозрительностью"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
         return
 
-    if answer == CORRECT_ANSWER:
-        correct_users.append({
-            'user_id': user.id,
-            'full_name': user.full_name
-        })
-        await context.bot.approve_chat_join_request(chat_id, user.id)
-        await update.message.reply_text("Ваш ответ правильный! Вы добавлены в группу.")
+    if not users_data:
+        await update.message.reply_text("Нет пользователей.")
+        return
+
+    response = "Список пользователей:\n\n"
+    for idx, user in enumerate(users_data, 1):
+        suspicious = "Да" if user['suspicious'] else "Нет"
+        answer = user['answer'] if user['answer'] else "Не ответил"
+        response += f"{idx}. Имя: {user['full_name']}, Подозрительность: {suspicious}, Ответ: {answer}\n"
+
+    await update.message.reply_text(response)
+
+async def add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление всех пользователей, которые ответили на вопрос"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
+        return
+
+    added_users = []
+    for user in users_data:
+        if user['answer']:  # Проверяем, что пользователь ответил на вопрос
+            added_users.append(user)
+
+    if not added_users:
+        await update.message.reply_text("Нет пользователей с ответом на вопрос.")
+        return
+
+    for user in added_users:
+        chat_id = user['chat_id']
+        await context.bot.approve_chat_join_request(update.message.chat.id, chat_id)
+
+    await update.message.reply_text(f"Добавлены следующие пользователи:\n" + "\n".join([user['full_name'] for user in added_users]))
+
+async def handle_chat_join_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка события одобрения или отклонения заявки пользователем"""
+    if update.chat_join_request.approved:
+        action = "одобрен"
     else:
-        declined_users.append({
-            'user_id': user.id,
-            'username': user.username,
-            'full_name': user.full_name,
-            'reason': "Неправильный ответ"
-        })
-        await context.bot.decline_chat_join_request(chat_id, user.id)
-        await update.message.reply_text("Ответ неправильный. Вы не можете быть добавлены в группу.")
+        action = "отклонен"
 
-async def list_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр принятых пользователей"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
-        return
+    user_id = update.chat_join_request.from_user.id
+    # Удаляем данные о пользователе после одобрения или отклонения заявки
+    users_data[:] = [user for user in users_data if user['user_id'] != user_id]
 
-    if not correct_users:
-        await update.message.reply_text("Нет принятых пользователей.")
-        return
-
-    response = "Список принятых пользователей:\n\n"
-    for user in correct_users:
-        response += f"ID: {user['user_id']}, Имя: {user['full_name']}\n"
-
-    await update.message.reply_text(response)
-
-async def list_declined_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр отклонённых пользователей"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
-        return
-
-    if not declined_users:
-        await update.message.reply_text("Нет отклонённых пользователей.")
-        return
-
-    response = "Список отклонённых пользователей:\n\n"
-    for user in declined_users:
-        response += f"ID: {user['user_id']}, Ник: {user['username']}, Имя: {user['full_name']}, Причина: {user['reason']}\n"
-
-    await update.message.reply_text(response)
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"Заявка пользователя {user_id} {action}."
+    )
 
 if __name__ == "__main__":
     TOKEN = "8046428888:AAE6subVaWXogC7rm3VxmxTYFG9PNKRxuHI"
@@ -130,10 +142,12 @@ if __name__ == "__main__":
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
     # Обработчик ответов пользователей
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer))
-    # Команда для просмотра отклонённых пользователей
-    app.add_handler(CommandHandler("decline_list", list_declined_users))
-    # Добавляем обработчик для команды list_correct
-    app.add_handler(CommandHandler("list_correct", list_correct))
+    # Команда для просмотра списка пользователей
+    app.add_handler(CommandHandler("show_users", list_users))
+    # Команда для добавления всех пользователей, которые ответили
+    app.add_handler(CommandHandler("add_users", add_users))
+    # Обработчик для событий одобрения или отклонения заявки
+    app.add_handler(ChatJoinRequestHandler(handle_chat_join_update))
 
     print("Бот запущен...")
     app.run_polling()
